@@ -14,7 +14,7 @@ Session: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on
 
 async def init_db() -> None:
     # import models so metadata knows them
-    from . import models  # noqa: F401
+    from bot.db import models  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     # sanity ping

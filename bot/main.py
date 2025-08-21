@@ -1,11 +1,14 @@
 # bot/main.py
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from .settings import BOT_TOKEN, OWNER_IDS
+from bot.settings import BOT_TOKEN, OWNER_IDS
+from bot.db.base import init_db, Session
+from bot.db.crud import get_or_create_user, create_feedback, counts
 
 # ---------- logging ----------
 logging.basicConfig(
@@ -23,15 +26,18 @@ MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("❓ Help", callback_data="help")],
 ])
 
-def _users_set(app) -> set:
-    if "users" not in app.bot_data:
-        app.bot_data["users"] = set()
-    return app.bot_data["users"]
-
 # ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    _users_set(context.application).add(user.id)
+    # persist (upsert) user in DB
+    async with Session() as session:
+        await get_or_create_user(
+            session,
+            tg_id=user.id,
+            username=user.username,
+            first=user.first_name,
+            lang=(user.language_code or None),
+        )
     await update.message.reply_text(
         f"Hi {user.first_name}! 👋\nChoose an option:",
         reply_markup=MENU
@@ -49,30 +55,29 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in OWNER_IDS:
         return await update.message.reply_text("⛔ Not allowed.")
-    users = _users_set(context.application)
-    await update.message.reply_text(f"📊 Unique users (this run): {len(users)}")
+    async with Session() as session:
+        user_count, fb_count = await counts(session)
+    await update.message.reply_text(
+        f"📊 Stats\n• Users: {user_count}\n• Feedback: {fb_count}"
+    )
 
 # ---------- callbacks ----------
 async def on_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("Sample bot (python-telegram-bot v21, async).")
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Sample bot with DB (SQLite + SQLAlchemy async).")
 
 async def on_help_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     await q.edit_message_text("Use the menu buttons or type /help.")
 
-# If user taps “Feedback” button, just prompt like the /feedback command
-async def on_feedback_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    await feedback_cmd(update, context)  # reuse the same logic
-
-# ---------- Day 3: feedback ----------
+# ---------- Day 3/4: feedback ----------
 WAITING_FEEDBACK = set()
 
 async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     WAITING_FEEDBACK.add(user.id)
-    # Depending on whether this came from a button or a command:
     if update.message:
         await update.message.reply_text("✍️ Please type your feedback now (send one message).")
     elif update.callback_query:
@@ -85,8 +90,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id in WAITING_FEEDBACK:
         WAITING_FEEDBACK.remove(user.id)
 
+        # persist feedback
+        async with Session() as session:
+            db_user = await get_or_create_user(
+                session,
+                tg_id=user.id,
+                username=user.username,
+                first=user.first_name,
+                lang=(user.language_code or None),
+            )
+            await create_feedback(session, user_id=db_user.id, message=text)
+
         # confirm to user
-        await update.message.reply_text("🙏 Thanks for your feedback!")
+        await update.message.reply_text("🙏 Thanks for your feedback! Saved.")
 
         # forward to owner(s)
         for oid in OWNER_IDS:
@@ -96,38 +112,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"💌 Feedback from {user.first_name} (@{user.username} | {user.id}):\n\n{text}"
                 )
             except Exception as e:
-                log.error("Could not send feedback to owner %s: %s", oid, e)
+                log.error("Owner notify failed (%s): %s", oid, e)
     else:
-        # Non-command loose message
         await update.message.reply_text("💡 Use /help to see commands.")
 
 # ---------- error handler ----------
+# ---- error handler ----
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
 
-# ---------- app ----------
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing in your .env")
 
+    # 1) Ensure DB schema exists once before starting (safe in sync main)
+    asyncio.run(init_db())
+
+    # 2) Build app and register handlers
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("feedback", feedback_cmd))
 
-    # callbacks
     app.add_handler(CallbackQueryHandler(on_about, pattern="^about$"))
     app.add_handler(CallbackQueryHandler(on_help_btn, pattern="^help$"))
-    app.add_handler(CallbackQueryHandler(on_feedback_btn, pattern="^feedback$"))
+    app.add_handler(CallbackQueryHandler(feedback_cmd, pattern="^feedback$"))
 
-    # text messages (captures feedback)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.add_error_handler(on_error)
 
+    # 3) Python 3.12: create & set an event loop for run_polling()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 4) Let PTB manage its own lifecycle (blocking call)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

@@ -6,9 +6,12 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
+from sqlalchemy import select, desc  # NEW: for /feedbacks query
+
 from bot.settings import BOT_TOKEN, OWNER_IDS
 from bot.db.base import init_db, Session
 from bot.db.crud import get_or_create_user, create_feedback, counts
+from bot.db.models import Feedback, User  # NEW: join user+feedback for /feedbacks
 
 # ---------- logging ----------
 logging.basicConfig(
@@ -25,6 +28,9 @@ MENU = InlineKeyboardMarkup([
     ],
     [InlineKeyboardButton("❓ Help", callback_data="help")],
 ])
+
+# ---------- state ----------
+WAITING_FEEDBACK: set[int] = set()
 
 # ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48,8 +54,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/start — open menu\n"
         "/help — this help\n"
+        "/feedback — send feedback\n"
+        "/cancel — cancel feedback mode\n"
         "/stats — owner only\n"
-        "/feedback — send feedback"
+        "/feedbacks [page] — owner only\n"
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,16 +80,21 @@ async def on_help_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await q.edit_message_text("Use the menu buttons or type /help.")
 
-# ---------- Day 3/4: feedback ----------
-WAITING_FEEDBACK = set()
-
+# ---------- feedback flow ----------
 async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     WAITING_FEEDBACK.add(user.id)
     if update.message:
-        await update.message.reply_text("✍️ Please type your feedback now (send one message).")
+        await update.message.reply_text("✍️ Please type your feedback now (send one message). Send /cancel to exit.")
     elif update.callback_query:
-        await update.callback_query.edit_message_text("✍️ Please type your feedback now (send one message).")
+        await update.callback_query.edit_message_text("✍️ Please type your feedback now (send one message). Send /cancel to exit.")
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id in WAITING_FEEDBACK:
+        WAITING_FEEDBACK.remove(user.id)
+        return await update.message.reply_text("❎ Feedback canceled.")
+    return await update.message.reply_text("You’re not in feedback mode.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -116,38 +129,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("💡 Use /help to see commands.")
 
+# ---------- admin: list feedbacks with pagination ----------
+async def feedbacks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in OWNER_IDS:
+        return await update.message.reply_text("⛔ Not allowed.")
+
+    # parse page number: /feedbacks [page]
+    page = 1
+    if context.args:
+        try:
+            page = max(1, int(context.args[0]))
+        except ValueError:
+            page = 1
+
+    page_size = 5
+    offset = (page - 1) * page_size
+
+    async with Session() as session:
+        # SELECT Feedback JOIN User, order by newest first, paginate
+        stmt = (
+            select(Feedback, User)
+            .join(User, Feedback.user_id == User.id)
+            .order_by(desc(Feedback.created_at))
+            .limit(page_size)
+            .offset(offset)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    if not rows:
+        return await update.message.reply_text(f"No feedback on page {page}.")
+
+    lines = [f"📥 Recent feedback (page {page}):"]
+    for fb, user in rows:
+        who = f"{user.first_name or ''} @{user.username}" if user.username else (user.first_name or "")
+        uid_str = f"({user.tg_id})" if user.tg_id else ""
+        lines.append(f"• #{fb.id} from {who} {uid_str}:\n  {fb.message}")
+    await update.message.reply_text("\n".join(lines))
+
 # ---------- error handler ----------
-# ---- error handler ----
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
 
+# ---------- app entry ----------
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing in your .env")
 
-    # 1) Ensure DB schema exists once before starting (safe in sync main)
+    # Ensure DB schema exists once before starting
     asyncio.run(init_db())
 
-    # 2) Build app and register handlers
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("feedback", feedback_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))        # NEW
+    app.add_handler(CommandHandler("feedbacks", feedbacks_cmd))  # NEW
 
+    # buttons
     app.add_handler(CallbackQueryHandler(on_about, pattern="^about$"))
     app.add_handler(CallbackQueryHandler(on_help_btn, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(feedback_cmd, pattern="^feedback$"))
 
+    # text messages (captures feedback)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.add_error_handler(on_error)
 
-    # 3) Python 3.12: create & set an event loop for run_polling()
+    # Python 3.12: set a loop so run_polling has one
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # 4) Let PTB manage its own lifecycle (blocking call)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
